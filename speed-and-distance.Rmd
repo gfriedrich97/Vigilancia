@@ -1,0 +1,214 @@
+---
+title: "CigControl_Mapa_Vigilancia"
+author: "Grupo 5"
+date: "24/5/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(readxl)
+library(knitr) #Para mejorar calidad de reportes
+library(tidyverse) #Manipulacion y visualización de data
+library(magrittr) #Manipulación de data
+library(kableExtra) #Mejorar calidad de reportes
+library(dlookr) #Si no funciona reinstalar "rmarkdown". Para diagnosticos generales
+library(lubridate) #Manejo de fechas
+library(Hmisc)
+library(plotly) #Graficar
+#-------Librerías espaciales: 
+library(rgdal)
+library(rgeos)
+library(sp)
+library(tmap)
+library(leaflet)
+```
+
+### Preparación de base de datos:
+
+```{r cars, echo=TRUE, warning = FALSE}
+#Directorio:
+setwd("C:/Users/gaga1/OneDrive/Documents/CigControl/Mapas Vigilancia")
+
+# Cragar base de datos:
+rm(list=ls())
+datos=read_xlsx('CigControl_2021_05_13_05_21 datos 2021.xlsx', sheet = "CigControl_2021_05_13_05_21")
+
+#----Filtrar por tipo de producto: sólo cigarrillos
+datos %<>% filter(producto == "Cigarrillo")
+
+#----Crear variable precio por stick
+datos$BCCantiCaje %<>% as.numeric()
+datos$BCCantiCiga %<>% as.numeric()
+datos$BCCarton %<>% as.numeric()
+
+datos %<>%
+  mutate(NumCig = ifelse(BCTipoCompra == "Cajetilla", BCCantiCaje*BCCantiCiga, ifelse(BCTipoCompra == "Cigarrillo suelto", BCCantiCiga, BCCantiCaje*BCCantiCiga*1))) %>%
+  mutate(Precio_Cig = BCPago/NumCig)
+
+#---- Filtrar por precios 
+
+datos%<>% filter(between(Precio_Cig,100,3000))
+
+#---- Dividir base de datos por tipo de mercado (legal vs ilegal)
+
+legal <- filter(datos,datos$`Comité etiquetado No=0 Si=1`== 1)
+ilegal <- filter(datos,datos$`Comité etiquetado No=0 Si=1`== 0)
+
+
+#---- Estadísticas descriptivas del precio x stick 
+
+datos_legal <- legal %>% 
+  group_by(DP,Departamento) %>% 
+  dplyr::summarise(min = min(Precio_Cig), mediana = median(Precio_Cig), max = max(Precio_Cig), n = n(),.groups = "keep")
+
+datos_ilegal <- ilegal %>% 
+  group_by(DP,Departamento) %>% 
+  dplyr::summarise(min = min(Precio_Cig), mediana = median(Precio_Cig), max = max(Precio_Cig), n = n(),.groups = "keep")
+
+
+```
+
+
+```{r, echo=FALSE, warning = FALSE}
+#---- Agregar Latitud y Longitud a cada Municipio
+
+datos_legal$x <-c(-75.56359,-74.08175,-75.51444,-75.60623,-76.61316,-74.21682,-75.28189,-74.19904,-73.62664,-77.28111,-72.50782,-75.68111,-73.1198,-75.23222,-76.5225,-72.39586)
+datos_legal$y <- c(6.25184,4.60971,10.39972,1.61438,2.43823,4.57937,2.9273,11.24079,4.142,1.21361,7.89391,4.53389,7.12539,4.43889,3.43722,5.33775)
+
+datos_ilegal$x <-c(-75.56359,-74.08175,-75.60623,-75.88143,-75.28189,-77.28111,-72.50782)
+datos_ilegal$y <-c(6.25184,4.60971,1.61438,8.74798,2.9273,1.21361,7.89391)
+
+#----- Generar escala logarítmica de los precios: 
+
+datos_legal %<>% 
+  mutate(mediana_log = (mediana)^2)
+
+datos_ilegal %<>% 
+  mutate(mediana_log = (mediana)^2)
+```
+
+### Mapas de prevalencia mes y precio por stick de cigarrillo (separado por mercado legal e ilegal) a nivel departamento en Colombia:
+
+```{r, echo=TRUE, warning = FALSE}
+
+#------- Cargar información de prevalencias para cada departamento con información de precios. Fuente: ENCSPA 2019
+
+prevalencias=read_xlsx('Prevalencia_ENCSPA2019.xlsx')
+prevalencias$Prevalencia %<>% as.numeric()
+
+prevalencia_legal <- merge(x = datos_legal , y = prevalencias , by.x = "DP" , by.y = "CODIGO" , all.x=TRUE)
+prevalencia_ilegal <- merge(x = datos_ilegal , y = prevalencias , by.x = "DP" , by.y = "CODIGO" , all.x=TRUE)
+
+
+#------- Importar un SpatialPolygonDataframe: Fuente DANE
+
+colombia <- readOGR(dsn = "COLOMBIA", layer = "COLOMBIA")
+
+#--------Convertir excel con infromación de precios a un SpatialPointsDataFrame:
+
+#Proyectar los puntos:
+coordinates(datos_legal)<- ~ x + y
+#class(datos_legal)
+
+coordinates(datos_ilegal)<- ~ x + y
+#class(datos_ilegal)
+
+#proj4string(colombia)
+proyeccion<-proj4string(colombia)
+proj4string(datos_legal) <- CRS(proyeccion) 
+proj4string(datos_ilegal) <- CRS(proyeccion) 
+
+#------- Unir base de datos con información de prevalencias al shapefile de Colombia
+
+#Prevalencias para mapa con información de mercado legal
+#head(colombia@data)
+colombia_legal <- merge(x = colombia , y = prevalencia_legal , by.x = "DPTO_CCDGO" , by.y = "DP" , all.x=TRUE)
+#head(colombia_legal@data)
+
+#Prevalencias para mapa con información de mercado ilegal
+colombia_ilegal <- merge(x = colombia , y = prevalencia_ilegal , by.x = "DPTO_CCDGO" , by.y = "DP" , all.x=TRUE)
+#head(colombia_ilegal@data)
+
+
+```
+#### Mapa: Colombia, Mercado Legal de cigarrillos:
+
+```{r, echo=TRUE, warning = FALSE}
+
+#------- Pintar mapa con prevalencias y puntos con infromación de precios: Mercado legal
+
+tmap_mode("view")
+
+mapa_legal<-tm_shape(colombia_legal) + tm_fill(c("Prevalencia mes (%):"="Prevalencia"), palette = "Reds",
+style = "quantile", title = "Prevalencia mes(%)", id="DPTO_NMBR") +
+tm_borders(alpha=.4) +
+tm_shape(datos_legal) + tm_bubbles(size = "mediana_log", col = "mediana",
+palette = "Blues", style = "quantile",
+legend.size.show = FALSE,
+title.col = "Mediana precio por stick($)",
+border.col = "black", border.lwd = 0.1,
+border.alpha = 0.2, id="Departamento",
+		popup.vars = c("Precio mínimo observado por stick ($):"= "min","Mediana de precio observado por stick ($):"="mediana","Precio máximo observado por stick ($):"="max"))+
+tm_layout(legend.text.size = 0.8,
+legend.title.size = 0.8, legend.position = c("RIGHT", "BOTTOM"), frame = FALSE, scale = 0.8,legend.outside=TRUE)
+
+
+# ver mapa
+mapa_legal
+```
+
+#### Mapa: Colombia, Mercado ILegal de cigarrillos:
+
+```{r,echo=TRUE, warning = FALSE}
+#------- Pintar mapa con prevalencias y puntos con infromación de precios: Mercado ilegal
+
+mapa_ilegal<-tm_shape(colombia_ilegal) + tm_fill(c("Prevalencia mes (%):"="Prevalencia"), palette = "Reds",
+style = "quantile", title = "Prevalencia mes(%)", id="DPTO_NMBR") +
+tm_borders(alpha=.4) +
+tm_shape(datos_ilegal) + tm_bubbles(size = "mediana_log", col = "mediana",
+palette = "Blues", style = "quantile",
+legend.size.show = FALSE,
+title.col = "Mediana precio por stick($)",
+border.col = "black", border.lwd = 0.1,
+border.alpha = 0.2,id="Departamento",
+			popup.vars = c("Precio mínimo observado por stick ($):"= "min","Mediana de precio observado por stick ($):"="mediana","Precio máximo observado por stick ($):"="max"))+
+tm_layout(legend.text.size = 0.8,
+legend.title.size = 0.8, legend.position = c("RIGHT", "BOTTOM"), frame = FALSE, scale = 0.8,legend.outside=TRUE)
+
+#ver mapa
+mapa_ilegal
+```
+
+### Resolución preguntas: 
+
+1. Describa la información representada en el mapa y la fuente de esta información.
+
+El primer mapa está compuesto por dos capas. La primera representa, a partir de polígonos con un gradiente de color organizado en quintiles, las prevalencias mes de consumo de tabaco a nivel departamental. La segunda representa, a partir de puntos con un gradiente de color y tamaño clasificado por quintiles, la mediana del precio por stick de los cigarrillos comercializados legalmente. Adicionalmente, el mapa tiene un elemento interactivo puesto que al pasar el cursor por esos puntos se despliega información sobre el rango de estos precios.  El segundo mapa tiene la misma estructura con la diferencia de que representa la mediana del precio por stick de los cigarrillos ilegales. Para efectos de este ejercicio se considera ilegal un cigarrillo cuya marca no tenga vigente la aprobación por parte del comité de etiquetado y empaquetado del Ministerio de Salud y Protección Social. Por último, los polígonos grises corresponden a departamentos para los cuáles no contamos con información de precios, bien sea legales o ilegales. 
+Para construir el mapa se obtuvo la información de dos fuentes: 
+1. Estudio Nacional de Consumo de Sustancias Psicoactivas 2019: información de prevalencias mes a nivel departamento. 
+2. Base de datos generada por una red de crowdsourcing utilizando el aplicativo CigControl, resultado de un proyecto de la Fundación Anaas, Fundación Salutia y Universidad Jorge Tadeo Lozano. Los datos fueron recolectados entre enero y mayo de 2021 por 31 estudiantes de los programas de posgrado de la universidad, quienes recibieron entrenamiento para realizar la captura de observaciones. La base de datos cuenta con 2925 observaciones. 
+
+
+2. Realice una lectura crítica del mapa. Interprete el contenido del mapa y su utilidad para representar o analizar una situación de salud pública.
+
+Mapa de mercado legal:
+Estos mapas son claves para monitorear el efecto de la política de impuestos al consumo de tabaco en los precios, que son el mecanismo por el cuál actúa esta intervención sobre la población. La industria tabacalera tiene un poder de mercado elevado que le permite adoptar estrategias de discriminación de precios y de esta manera disminuir el impacto de la política de impuestos con objetivos de salud. La discriminación de precios puede tener una dimensión espacial. En el primer mapa se visualiza como un departamento con baja prevalencia (Bolívar) tiene una media de precio alto, sugiriendo que la industria tabacalera procura proteger sus ganancias a través de márgenes unitarios elevados, dado que es un mercado de bajo volumen (por combinación de tamaño de la población y prevalencias bajas). Este hallazgo contradice los reclamos de la industria de estar sujeto a presiones de competencia por contrabando, precisamente en la región Caribe. 
+El mapa también permite evidenciar que en el departamento de Antioquia se observa una mediana de precios menor a la mayoría de los departamentos. Esto podría estar explicado por una estrategia de negocio distinta a la de Bolívar, con márgenes más bajos de comercialización que se compensan por un mayor volumen de ventas. 
+Por otro lado, es interesante observar el patrón espacial de los precios en Colombia. No puede decirse que los precios altos estén concentrados en una sola región. También es evidente que el nivel de protección que puede ofrecer el impuesto no es homogéneo, precisamente por el poder de la industria de definir los precios. Esto apunta a considerar la posibilidad de política que incorpore, además del impuesto, la exigencia de precios mínimos. 
+
+Mapa de mercado ilegal:
+Es importante separar el mercado legal de ilegal puesto que el contrabando de cigarrillos es un problema de salud pública reconocido por el Convenio Marco para el Control de Tabaco. En el caso de la política de impuestos, es posible que ingresen cigarrillos que no tributan y que pueden ser vendidos a precios más bajos. Si bien la industria procura sobreestimar el tamaño de este problema, es indudable que algunas regiones del país tienen problemas de contrabando. En el mapa se ilustra los departamentos en dónde aparecieron marcas consideradas ilegales a la luz del criterio enunciado. Las zonas fronterizas de Nariño y Norte de Santander reportan la mayor cantidad de observaciones de contrabando. Esto no sorprende, puesto que cabe esperar que estos sean los departamentos con mayor incidencia de este problema, no sólo por su ubicación geográfica, sino también por sus condiciones institucionales. Llama la atención que en Nariño el precio de las marcas de contrabando esta por encima del precio del mercado legal, a diferencia de lo que ocurre en Norte de Santander. 
+
+A partir de los dos mapas es posible: 
+•	Dar información a las autoridades de control acerca de la focalización de esfuerzos de lucha contra el contrabando en el territorio. 
+•	Permite explorar hipótesis acerca de la interacción de los precios en el mercado legal e ilegal.
+•	Revela las estrategias de precios de la industria tabacalera. 
+
+Nota: estas son conclusiones preliminares dado que en algunos departamentos el número de observaciones aún es muy bajo. 
+
+3. Comente sobre las posibilidades y restricciones de este tipo de geovisores para procesos de toma de decisiones en investigación en salud pública.  
+
+Una de las limitaciones percibidas de la presentación de información georreferenciada, es la agregación por divisiones político-administrativas.  Debido a la diversidad socioeconómica y cultural del país, este tipo de agregación puede esconder el comportamiento de algunos factores predisponentes o determinantes de los desenlaces en salud, caso particular para el tabaquismo. Esta distribución desigual de recursos físicos, económicos, sociales y ambientales en pequeños territorios, dificulta la desagregación de la información presentada por medio de los mapas y como consecuencia podría esconder algunas características poblaciones importantes para el análisis de la problemática. 
+
+En esta misma línea, las divisiones político-administrativas podrían invisibilizar también, dinámicas del mercado de cigarrillo que ocurren en el territorio y que no necesariamente obedecen a las lógicas de la división por departamento. Por ejemplo, la presencia de redes de comercialización del mismo producto en distintos lugares del territorio, fenómenos culturales en cuanto al consumo de contrabando y situación socioeconómica que predispone a consumir cigarrillos en cierto rango de precios. Por ende, este es un insumo que se debe sumar a otros tipos de análisis y herramientas para poder continuar con mejoras en el diseño e implementación de la política de impuestos y eliminación del contrabando de productos de tabaco. Otra limitación en el sentido contrario, es que hay otras intervenciones de control de tabaco que interactúan con la política de impuestos sobre las que no tenemos información espacial sistematizada (amientes libres de humo, medidas prohibición a la publicidad, promoción y patrocinio o la oferta de programas de cesación).  
